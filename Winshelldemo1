@@ -1,0 +1,572 @@
+/*
+ * LSH - 一个简单的Shell程序
+ * 支持基本的命令行操作，包括文件管理、系统信息等
+ * 具有图形用户界面，支持背景图片设置和多语言
+ */
+
+#include <stdio.h>      // 标准输入输出
+#include <stdlib.h>     // 内存管理
+#include <string.h>     // 字符串操作
+#include <locale.h>     // 本地化设置
+#include <direct.h>     // 目录操作
+#include <windows.h>    // Windows API
+#include <commctrl.h>   // 通用控件
+
+#pragma comment(lib, "comctl32")  // 链接通用控件库
+#pragma comment(lib, "gdi32")     // 链接GDI库
+#pragma comment(lib, "user32")    // 链接用户界面库
+#pragma comment(lib, "kernel32")  // 链接内核库
+
+#define LSH_RL_BUFSIZE 1024  // 读取行缓冲区大小
+#define LSH_TOK_BUFSIZE 64   // 标记缓冲区大小
+#define LSH_TOK_DELIM " \t\r\n\a"  // 标记分隔符
+
+int language = 0; // 语言设置：0=英文, 1=中文
+char *background_image = NULL; // 背景图片路径
+
+// GUI相关变量
+HWND hwndMain;           // 主窗口句柄
+HDC hdcMain;             // 主设备上下文
+HBITMAP hBackground = NULL;  // 背景位图
+HFONT hFont = NULL;      // 字体句柄
+int scrollPos = 0;       // 滚动位置
+int maxScroll = 0;       // 最大滚动位置
+char outputBuffer[4096] = ""; // 输出缓冲区
+char inputBuffer[256] = "";   // 输入缓冲区
+int outputPos = 0;            // 输出位置（未使用）
+
+// 函数声明
+LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);  // 窗口过程
+void LoadBackgroundImage(const char *path);  // 加载背景图片
+void DrawBackground(HDC hdc, RECT *rect);    // 绘制背景
+void AppendOutput(const char *text);         // 添加输出文本
+void ProcessCommand(const char *cmd);        // 处理命令
+
+// 打印ASCII艺术
+void print_ascii_art() {
+    const char *art = "      .----------.\n    /              \\\n   |   .        .   |\n   |                |\n   |      __        |\n   |    /    \\      |\n    \\  |      |    /\n     \\ |______|   /\n      \\          /\n       '--------'\n";
+    AppendOutput(art);
+}
+
+// 根据语言获取消息
+char* get_msg(const char* en, const char* zh) {
+    return language == 0 ? (char*)en : (char*)zh;
+}
+
+
+// Shell相关函数声明
+void lsh_loop(void);              // 主循环（控制台版本）
+char *lsh_read_line(void);        // 读取一行输入
+char **lsh_split_line(char *line); // 分割命令行
+int lsh_execute(char **args);     // 执行命令
+int lsh_cd(char **args);          // 切换目录
+int lsh_help(char **args);        // 显示帮助
+int lsh_exit(char **args);        // 退出
+int lsh_pwd(char **args);         // 显示当前目录
+int lsh_ls(char **args);          // 列出文件
+int lsh_echo(char **args);        // 回显文本
+int lsh_mkdir(char **args);       // 创建目录
+int lsh_rmdir(char **args);       // 删除目录
+int lsh_ps(char **args);          // 显示进程
+int lsh_lang(char **args);        // 切换语言
+int lsh_bg(char **args);          // 设置背景
+
+// 内置命令数组
+char *builtin_str[] = { "cd", "help", "exit", "pwd", "ls", "echo", "mkdir", "rmdir", "ps", "lang", "bg" };
+char *builtin_str_cn[] = { "切换目录", "帮助", "退出", "当前目录", "列出文件", "回显", "创建目录", "删除目录", "进程列表", "语言", "背景" };
+int (*builtin_func[]) (char **) = { &lsh_cd, &lsh_help, &lsh_exit, &lsh_pwd, &lsh_ls, &lsh_echo, &lsh_mkdir, &lsh_rmdir, &lsh_ps, &lsh_lang, &lsh_bg };
+
+// Windows GUI主函数
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    // 设置本地化和控制台编码
+    setlocale(LC_ALL, "");
+    SetConsoleOutputCP(CP_UTF8);
+
+    // 加载保存的背景
+    FILE *f = fopen("background.txt", "r");
+    if (f) {
+        char buf[256];
+        if (fgets(buf, sizeof(buf), f)) {
+            buf[strcspn(buf, "\n")] = 0;
+            background_image = strdup(buf);
+            LoadBackgroundImage(background_image);
+        }
+        fclose(f);
+    }
+
+    // 加载保存的语言
+    f = fopen("language.txt", "r");
+    if (f) {
+        char buf[16];
+        if (fgets(buf, sizeof(buf), f)) {
+            language = atoi(buf);
+        }
+        fclose(f);
+    }
+
+    // 注册窗口类
+    WNDCLASSEX wc = {0};
+    wc.cbSize = sizeof(WNDCLASSEX);
+    wc.lpfnWndProc = WndProc;          // 窗口过程函数
+    wc.hInstance = hInstance;          // 实例句柄
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);  // 光标
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);  // 背景画刷
+    wc.lpszClassName = "LSHWindow";    // 类名
+    RegisterClassEx(&wc);
+
+    // 创建支持中文的字体
+    hFont = CreateFont(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, GB2312_CHARSET,
+                       OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+                       DEFAULT_PITCH | FF_DONTCARE, "宋体");
+
+    // 创建主窗口
+    hwndMain = CreateWindowEx(0, "LSHWindow", "LSH - Simple Shell", WS_OVERLAPPEDWINDOW | WS_VSCROLL,
+                              CW_USEDEFAULT, CW_USEDEFAULT, 800, 600,
+                              NULL, NULL, hInstance, NULL);
+    ShowWindow(hwndMain, nCmdShow);    // 显示窗口
+    UpdateWindow(hwndMain);            // 更新窗口
+
+    // 初始化输出
+    print_ascii_art();
+    AppendOutput(get_msg("Welcome to LSH - A simple shell\nType 'help' to see available commands.\n> ", "欢迎使用 LSH - 一个简单的 shell\n输入 'help' 或 '帮助' 查看可用命令。\n> "));
+
+    // 消息循环
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    // 清理资源
+    if (hBackground) DeleteObject(hBackground);
+    return msg.wParam;
+}
+
+// 读取一行输入（控制台版本）
+char *lsh_read_line(void) {
+    int bufsize = LSH_RL_BUFSIZE, position = 0, c;
+    char *buffer = malloc(sizeof(char) * bufsize);
+    if (!buffer) { 
+        fprintf(stderr, "lsh: allocation error\n"); 
+        exit(EXIT_FAILURE); 
+    }
+    while (1) {
+        c = getchar();
+        if (c == EOF || c == '\n') { 
+            buffer[position] = '\0'; 
+            return buffer; 
+        }
+        buffer[position] = c;
+        position++;
+        if (position >= bufsize) {
+            bufsize += LSH_RL_BUFSIZE;
+            buffer = realloc(buffer, bufsize);
+            if (!buffer) { 
+                fprintf(stderr, "lsh: allocation error\n"); 
+                exit(EXIT_FAILURE); 
+            }
+        }
+    }
+}
+
+// 分割命令行成标记数组
+char **lsh_split_line(char *line) {
+    int bufsize = LSH_TOK_BUFSIZE, position = 0;
+    char **tokens = malloc(bufsize * sizeof(char*));
+    char *token;
+    if (!tokens) { 
+        fprintf(stderr, "lsh: allocation error\n"); 
+        exit(EXIT_FAILURE); 
+    }
+    token = strtok(line, LSH_TOK_DELIM);
+    while (token != NULL) {
+        tokens[position] = strdup(token);
+        position++;
+        if (position >= bufsize) {
+            bufsize += LSH_TOK_BUFSIZE;
+            tokens = realloc(tokens, bufsize * sizeof(char*));
+            if (!tokens) { 
+                fprintf(stderr, "lsh: allocation error\n"); 
+                exit(EXIT_FAILURE); 
+            }
+        }
+        token = strtok(NULL, LSH_TOK_DELIM);
+    }
+    tokens[position] = NULL;
+    return tokens;
+}
+
+// 获取内置命令数量
+int lsh_num_builtins() { 
+    return sizeof(builtin_str) / sizeof(char *); 
+}
+
+// 切换目录命令
+int lsh_cd(char **args) {
+    if (args[1] == NULL) { 
+        AppendOutput(get_msg("lsh: expected argument to \"cd\"\n", "lsh: \"cd\" 命令需要参数\n")); 
+    } else { 
+        if (chdir(args[1]) != 0) { 
+            AppendOutput(get_msg("Error changing directory\n", "切换目录错误\n"));
+        } else {
+            AppendOutput(get_msg("Directory changed\n", "目录已切换\n"));
+        }
+    }
+    return 1;
+}
+
+// 显示帮助信息
+int lsh_help(char **args) {
+    AppendOutput(get_msg("LSH - A simple shell\nType program names and arguments, and hit enter.\n", "LSH - 一个简单的 shell\n输入程序名和参数，然后按回车。\n"));
+    AppendOutput(get_msg("Built-in commands:\n", "内置命令：\n"));
+    for (int i = 0; i < lsh_num_builtins(); i++) { 
+        char buf[256];
+        sprintf(buf, "  %s / %s\n", builtin_str[i], builtin_str_cn[i]); 
+        AppendOutput(buf);
+    }
+    return 1;
+}
+
+// 退出命令
+int lsh_exit(char **args) { 
+    AppendOutput(get_msg("Exiting LSH...\n", "正在退出 LSH...\n"));
+    PostQuitMessage(0);  // 退出GUI
+    return 0;       // 返回0表示退出
+}
+
+// 显示当前目录
+int lsh_pwd(char **args) {
+    char cwd[1024];
+    if (_getcwd(cwd, sizeof(cwd)) != NULL) { 
+        char buf[1024];
+        sprintf(buf, "%s\n", cwd);
+        AppendOutput(buf);
+    } else { 
+        AppendOutput(get_msg("Error getting current directory\n", "获取当前目录错误\n"));
+    }
+    return 1;
+}
+
+// 列出文件
+int lsh_ls(char **args) {
+    WIN32_FIND_DATA findFileData;
+    HANDLE hFind;
+    char path[1024] = "*.*";
+    if (args[1] != NULL) {
+        strcpy(path, args[1]);
+        if (path[strlen(path)-1] != '\\') strcat(path, "\\");
+        strcat(path, "*.*");
+    }
+    hFind = FindFirstFile(path, &findFileData);
+    if (hFind == INVALID_HANDLE_VALUE) {
+        AppendOutput(get_msg("Error listing files\n", "列出文件错误\n"));
+    } else {
+        do {
+            char buf[256];
+            sprintf(buf, "%s\n", findFileData.cFileName);
+            AppendOutput(buf);
+        } while (FindNextFile(hFind, &findFileData) != 0);
+        FindClose(hFind);
+    }
+    return 1;
+}
+
+// 回显文本
+int lsh_echo(char **args) {
+    char buf[1024] = "";
+    for (int i = 1; args[i] != NULL; i++) { 
+        strcat(buf, args[i]);
+        strcat(buf, " ");
+    }
+    strcat(buf, "\n");
+    AppendOutput(buf);
+    return 1;
+}
+
+// 创建目录
+int lsh_mkdir(char **args) {
+    if (args[1] == NULL) { 
+        AppendOutput(get_msg("lsh: expected argument to \"mkdir\"\n", "lsh: \"mkdir\" 命令需要参数\n")); 
+    } else { 
+        if (_mkdir(args[1]) != 0) { 
+            AppendOutput(get_msg("Error creating directory\n", "创建目录错误\n"));
+        } else {
+            AppendOutput(get_msg("Directory created\n", "目录已创建\n"));
+        }
+    }
+    return 1;
+}
+
+// 删除目录
+int lsh_rmdir(char **args) {
+    if (args[1] == NULL) { 
+        AppendOutput(get_msg("lsh: expected argument to \"rmdir\"\n", "lsh: \"rmdir\" 命令需要参数\n")); 
+    } else { 
+        if (_rmdir(args[1]) != 0) { 
+            AppendOutput(get_msg("Error removing directory\n", "删除目录错误\n"));
+        } else {
+            AppendOutput(get_msg("Directory removed\n", "目录已删除\n"));
+        }
+    }
+    return 1;
+}
+
+// 显示进程列表
+int lsh_ps(char **args) {
+    system("start cmd /k \"tasklist & pause\"");
+    return 1;
+}
+
+// 切换语言
+int lsh_lang(char **args) {
+    if (args[1] == NULL) {
+        AppendOutput(get_msg("Current language: English\n", "当前语言: 中文\n"));
+    } else if (strcmp(args[1], "en") == 0 || strcmp(args[1], "english") == 0) {
+        language = 0;
+        // 保存语言到文件
+        FILE *f = fopen("language.txt", "w");
+        if (f) {
+            fprintf(f, "%d\n", language);
+            fclose(f);
+        }
+        AppendOutput("Switched to English\n");
+    } else if (strcmp(args[1], "zh") == 0 || strcmp(args[1], "chinese") == 0) {
+        language = 1;
+        // 保存语言到文件
+        FILE *f = fopen("language.txt", "w");
+        if (f) {
+            fprintf(f, "%d\n", language);
+            fclose(f);
+        }
+        AppendOutput("Switched to Chinese\n");
+    } else {
+        AppendOutput(get_msg("Invalid language. Use 'en' or 'zh'\n", "无效语言。使用 'en' 或 'zh'\n"));
+    }
+    return 1;
+}
+
+// 设置背景图片
+int lsh_bg(char **args) {
+    if (args[1] == NULL) {
+        if (background_image) {
+            char buf[256];
+            sprintf(buf, get_msg("Current background: %s\n", "当前背景: %s\n"), background_image);
+            AppendOutput(buf);
+        } else {
+            AppendOutput(get_msg("No background set\n", "未设置背景\n"));
+        }
+    } else {
+        FILE *file = fopen(args[1], "r");
+        if (file) {
+            fclose(file);
+            if (strstr(args[1], ".bmp") || strstr(args[1], ".BMP")) {
+                background_image = strdup(args[1]);
+                LoadBackgroundImage(background_image);
+                // 保存背景到文件
+                FILE *f = fopen("background.txt", "w");
+                if (f) {
+                    fprintf(f, "%s\n", background_image);
+                    fclose(f);
+                }
+                char buf[256];
+                sprintf(buf, get_msg("Background set to: %s\n", "背景设置为: %s\n"), background_image);
+                AppendOutput(buf);
+                InvalidateRect(hwndMain, NULL, TRUE);
+            } else {
+                AppendOutput(get_msg("Invalid file type. Only BMP files are supported.\n", "无效文件类型。只支持BMP文件。\n"));
+            }
+        } else {
+            char buf[256];
+            sprintf(buf, get_msg("File not found: %s\n", "文件未找到: %s\n"), args[1]);
+            AppendOutput(buf);
+        }
+    }
+    return 1;
+}
+
+// 执行命令
+int lsh_execute(char **args) {
+    if (args[0] == NULL) { return 1; }
+    for (int i = 0; i < lsh_num_builtins(); i++) {
+        if (strcmp(args[0], builtin_str[i]) == 0 || strcmp(args[0], builtin_str_cn[i]) == 0) { 
+            return (*builtin_func[i])(args); 
+        }
+    }
+    print_ascii_art();
+    printf(get_msg("Command not found: %s\n", "命令未找到: %s\n"), args[0]);
+    return 1;
+}
+
+// 主循环（控制台版本）
+void lsh_loop(void) {
+    char *line; char **args; int status;
+    do {
+        printf("> ");
+        line = lsh_read_line();
+        args = lsh_split_line(line);
+        status = lsh_execute(args);
+        free(line);
+        for (int i = 0; args[i] != NULL; i++) { free(args[i]); }
+        free(args);
+    } while (status);
+}
+
+// 窗口过程函数，处理GUI消息
+LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_PAINT: {  // 绘制消息
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(hwnd, &ps);
+            RECT rect;
+            GetClientRect(hwnd, &rect);
+            DrawBackground(hdc, &rect);  // 绘制背景
+            // 选择字体
+            HFONT oldFont = (HFONT)SelectObject(hdc, hFont);
+            // 绘制文本
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, RGB(0, 0, 255));
+            // 创建显示缓冲区，包含输出和当前输入
+            char displayBuffer[4096 + 256];
+            strcpy(displayBuffer, outputBuffer);
+            strcat(displayBuffer, "> ");
+            strcat(displayBuffer, inputBuffer);
+            // 转换到Unicode并绘制
+            int wlen = MultiByteToWideChar(CP_UTF8, 0, displayBuffer, -1, NULL, 0);
+            WCHAR *wbuf = (WCHAR*)malloc(wlen * sizeof(WCHAR));
+            MultiByteToWideChar(CP_UTF8, 0, displayBuffer, -1, wbuf, wlen);
+            // 计算文本高度并设置滚动条
+            RECT calcRect = rect;
+            DrawTextW(hdc, wbuf, -1, &calcRect, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_CALCRECT);
+            int textHeight = calcRect.bottom - calcRect.top;
+            SCROLLINFO si;
+            si.cbSize = sizeof(SCROLLINFO);
+            si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+            si.nMin = 0;
+            si.nMax = textHeight > rect.bottom ? textHeight - rect.bottom : 0;
+            si.nPage = rect.bottom;
+            si.nPos = scrollPos;
+            SetScrollInfo(hwnd, SB_VERT, &si, TRUE);
+            ShowScrollBar(hwnd, SB_VERT, si.nMax > 0);
+            maxScroll = si.nMax;  // 更新最大滚动位置
+            // 绘制文本，考虑滚动
+            RECT drawRect = rect;
+            drawRect.top -= scrollPos;
+            DrawTextW(hdc, wbuf, -1, &drawRect, DT_LEFT | DT_TOP | DT_WORDBREAK);
+            free(wbuf);
+            // 恢复字体
+            SelectObject(hdc, oldFont);
+            EndPaint(hwnd, &ps);
+            break;
+        }
+        case WM_CHAR: {  // 字符输入消息
+            if (wParam == VK_RETURN) {  // 回车键
+                AppendOutput("\n");
+                ProcessCommand(inputBuffer);  // 处理命令
+                inputBuffer[0] = '\0';  // 清空输入缓冲区
+                InvalidateRect(hwnd, NULL, TRUE);  // 重绘窗口
+            } else if (wParam == VK_BACK) {  // 退格键
+                int len = strlen(inputBuffer);
+                if (len > 0) inputBuffer[len - 1] = 0;
+            } else {  // 其他字符
+                char ch = (char)wParam;
+                char tmp[2] = { ch, '\0' };
+                strncat(inputBuffer, tmp, 1);
+            }
+            InvalidateRect(hwnd, NULL, TRUE);
+            break;
+        }
+        case WM_VSCROLL: {  // 垂直滚动消息
+            int oldPos = scrollPos;
+            int newPos = oldPos;
+            switch (LOWORD(wParam)) {
+                case SB_LINEUP: newPos -= 50; break;
+                case SB_LINEDOWN: newPos += 50; break;
+                case SB_PAGEUP: newPos -= 300; break;  // 假设页面大小约300像素
+                case SB_PAGEDOWN: newPos += 300; break;
+                case SB_THUMBTRACK: newPos = HIWORD(wParam); break;
+            }
+            newPos = max(0, min(newPos, maxScroll));
+            if (newPos != oldPos) {
+                scrollPos = newPos;
+                SetScrollPos(hwnd, SB_VERT, newPos, TRUE);
+                InvalidateRect(hwnd, NULL, TRUE);
+                SetFocus(hwnd);  // 确保窗口保持焦点
+            }
+            break;
+        }
+        case WM_MOUSEWHEEL: {  // 鼠标滚轮消息
+            int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+            int newPos = scrollPos - (delta / WHEEL_DELTA) * 50;
+            newPos = max(0, min(newPos, maxScroll));
+            if (newPos != scrollPos) {
+                scrollPos = newPos;
+                SetScrollPos(hwnd, SB_VERT, newPos, TRUE);
+                InvalidateRect(hwnd, NULL, TRUE);
+                SetFocus(hwnd);  // 确保窗口保持焦点
+            }
+            break;
+        }
+        case WM_DESTROY:  // 窗口销毁消息
+            // 清理资源
+            if (hFont) DeleteObject(hFont);
+            if (hBackground) DeleteObject(hBackground);
+            PostQuitMessage(0);  // 发送退出消息
+            break;
+        default:
+            return DefWindowProc(hwnd, msg, wParam, lParam);
+    }
+    return 0;
+}
+
+// 加载背景图片
+void LoadBackgroundImage(const char *path) {
+    if (hBackground) {
+        DeleteObject(hBackground);
+        hBackground = NULL;
+    }
+    hBackground = (HBITMAP)LoadImage(NULL, path, IMAGE_BITMAP, 0, 0, LR_LOADFROMFILE);
+}
+
+// 绘制背景
+void DrawBackground(HDC hdc, RECT *rect) {
+    if (hBackground) {  // 如果有背景图片
+        HDC hdcMem = CreateCompatibleDC(hdc);
+        HBITMAP hOld = (HBITMAP)SelectObject(hdcMem, hBackground);
+        BITMAP bm;
+        GetObject(hBackground, sizeof(BITMAP), &bm);
+        StretchBlt(hdc, 0, 0, rect->right, rect->bottom, hdcMem, 0, 0, bm.bmWidth, bm.bmHeight, SRCCOPY);
+        SelectObject(hdcMem, hOld);
+        DeleteDC(hdcMem);
+    } else {  // 默认背景
+        FillRect(hdc, rect, (HBRUSH)(COLOR_WINDOW + 1));
+    }
+}
+
+// 添加输出文本到缓冲区
+void AppendOutput(const char *text) {
+    strncat(outputBuffer, text, sizeof(outputBuffer) - strlen(outputBuffer) - 1);
+}
+
+// 处理用户输入的命令
+void ProcessCommand(const char *cmd) {
+    char **args = lsh_split_line((char*)cmd);  // 分割命令
+    if (args[0] == NULL) return;
+    int found = 0;
+    for (int i = 0; i < lsh_num_builtins(); i++) {
+        if (strcmp(args[0], builtin_str[i]) == 0 || strcmp(args[0], builtin_str_cn[i]) == 0) {
+            // 执行内置命令
+            (*builtin_func[i])(args);
+            found = 1;
+            break;
+        }
+    }
+    if (!found) {
+        char buf[256];
+        sprintf(buf, get_msg("Command not found: %s\n", "命令未找到: %s\n"), args[0]);
+        AppendOutput(buf);
+    }
+    AppendOutput("> ");  // 添加提示符
+    // 释放内存
+    for (int i = 0; args[i] != NULL; i++) free(args[i]);
+    free(args);
+}
